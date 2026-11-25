@@ -142,18 +142,16 @@ def acquire(
     device = policy.get("device")
     tenant_data = _ensure_tenant(store, tenant, total)
 
-    existing = check_idempotent(store, tenant, account)
-    if existing.get("reused") and existing.get("seat") in tenant_data["seats"]:
-        seat = int(existing["seat"])
-        record = tenant_data["seats"][seat]
-        if device is not None and device not in record["devices"]:
-            return _allocate_seat(
-                store, tenant_data, tenant, account, device, now, lease_seconds
-            )
-        return _reuse_seat(tenant, account, seat, record, device)
+    reclaim_expired(store, tenant, now)
+
+    seat = tenant_data["by_account"].get(account)
+    if seat is not None:
+        record = tenant_data["seats"].get(seat)
+        if record is not None and record.get("active"):
+            return _reuse_seat(tenant, account, int(seat), record, device)
 
     used = _used_seats(tenant_data)
-    if used > _tenant_total(tenant_data, total):
+    if used >= _tenant_total(tenant_data, total):
         return {
             "ok": False,
             "tenant": tenant,
@@ -183,15 +181,15 @@ def renew(
     seat_key = int(seat)
     record = tenant_data.get("seats", {}).get(seat_key)
     if record is None:
-        for other in store.get("tenants", {}).values():
-            other_record = other.get("seats", {}).get(seat_key)
-            if other_record is not None:
-                record = other_record
-                break
-    if record is None:
         return {"ok": False, "tenant": tenant, "seat": seat_key, "reason": "unknown_seat"}
     if not record.get("active"):
         return {"ok": False, "tenant": tenant, "seat": seat_key, "reason": "inactive"}
+    if record.get("lease_until", 0) <= now:
+        record["active"] = False
+        record["reclaimed_at"] = now
+        if tenant_data.get("by_account", {}).get(record.get("account")) == seat_key:
+            tenant_data["by_account"].pop(record.get("account"), None)
+        return {"ok": False, "tenant": tenant, "seat": seat_key, "reason": "expired"}
 
     record["lease_until"] = now + lease_seconds
     return {
@@ -219,7 +217,10 @@ def release(
     if not record.get("active"):
         return {"ok": False, "tenant": tenant, "seat": seat_key, "reason": "inactive"}
 
+    record["active"] = False
     record["released_at"] = now
+    if tenant_data.get("by_account", {}).get(record.get("account")) == seat_key:
+        tenant_data["by_account"].pop(record.get("account"), None)
     return {
         "ok": True,
         "tenant": tenant,
@@ -236,7 +237,7 @@ def reclaim_expired(store: dict[str, Any], tenant: str, now: float) -> int:
 
     reclaimed = 0
     for seat, record in tenant_data.get("seats", {}).items():
-        if record.get("active"):
+        if record.get("active") and record.get("lease_until", 0) <= now:
             record["active"] = False
             record["reclaimed_at"] = now
             if tenant_data.get("by_account", {}).get(record.get("account")) == seat:
@@ -252,11 +253,7 @@ def usage(store: dict[str, Any], tenant: str) -> dict[str, Any]:
         return {"tenant": tenant, "used": 0, "free": 0, "total": 0}
 
     total = int(tenant_data.get("total", 0))
-    used = sum(
-        len(record.get("devices", []))
-        for record in tenant_data.get("seats", {}).values()
-        if record.get("active")
-    )
+    used = _used_seats(tenant_data)
     return {
         "tenant": tenant,
         "used": used,
@@ -290,7 +287,7 @@ def check_idempotent(
     return {
         "tenant": tenant,
         "account": account,
-        "seat": int(store.get("next_seat", 1)),
+        "seat": seat,
         "reused": True,
         "lease_until": record.get("lease_until"),
     }
@@ -299,8 +296,8 @@ def check_idempotent(
 def validate_store(store: dict[str, Any], total: int) -> list[str]:
     """Return invariant violations found in a store."""
     issues: list[str] = []
-    limit = int(total)
     for tenant, tenant_data in store.get("tenants", {}).items():
+        limit = int(tenant_data.get("total", total))
         active = _active_records(tenant_data)
         used = len(active)
         free = limit - used
@@ -327,7 +324,6 @@ def seat_batch(
     policy = policy or {}
     store: dict[str, Any] = {"tenants": {}, "next_seat": 1}
     results: list[dict[str, Any]] = []
-    remaining = int(policy.get("total", 0))
 
     for request in requests:
         tenant = request.get("tenant")
@@ -338,22 +334,8 @@ def seat_batch(
         if "total" in request:
             request_policy["total"] = request["total"]
 
-        if remaining <= 0:
-            results.append(
-                {
-                    "ok": False,
-                    "tenant": tenant,
-                    "account": account,
-                    "seat": None,
-                    "reason": "no_seats",
-                }
-            )
-            continue
-
         result = acquire(store, tenant, account, now, request_policy)
         results.append({"tenant": tenant, "account": account, **result})
-        if result.get("ok"):
-            remaining -= 1
 
     granted = [result for result in results if result.get("ok")]
     rejected = [result for result in results if not result.get("ok")]
